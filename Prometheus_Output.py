@@ -2,184 +2,167 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-import urllib.request
 import os
+import urllib.request
+import numpy as np
+import time
 
-# Define the model path and URL for the hand landmarker model
-MODEL_PATH = 'hand_landmarker.task'
+# --- Global variables for detection results ---
+detection_results = None
+frame_timestamp_ms = 0
+
+# --- Callback function for live stream mode ---
+def results_callback(result: mp.tasks.vision.HandLandmarkerResult, output_image: mp.Image, timestamp_ms: int):
+    global detection_results, frame_timestamp_ms
+    detection_results = result
+    frame_timestamp_ms = timestamp_ms
+
+# --- Model Download and Setup ---
 MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
+MODEL_PATH = 'hand_landmarker.task'
 
-# Define Hand Landmark Connections manually for drawing using OpenCV.
-# This is a list of tuples, where each tuple represents a connection between two landmark indices.
+def download_model(model_url, model_path):
+    if not os.path.exists(model_path):
+        print(f"Downloading {os.path.basename(model_url)}...")
+        urllib.request.urlretrieve(model_url, model_path)
+        print("Download complete.")
+    else:
+        print(f"{os.path.basename(model_url)} already exists.")
+
+download_model(MODEL_URL, MODEL_PATH)
+
+# --- MediaPipe Hand Landmarker Setup ---
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=MODEL_PATH),
+    running_mode=VisionRunningMode.LIVE_STREAM,
+    num_hands=2,
+    result_callback=results_callback
+)
+detector = HandLandmarker.create_from_options(options)
+
+# --- Drawing Utilities ---
 HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),           # Thumb
-    (0, 5), (5, 6), (6, 7), (7, 8),           # Index finger
-    (9, 10), (10, 11), (11, 12),              # Middle finger
-    (13, 14), (14, 15), (15, 16),             # Ring finger
-    (0, 17), (17, 18), (18, 19), (19, 20),    # Pinky finger
-    (5, 9), (9, 13), (13, 17)                 # Palm base connections
+    (0, 1), (1, 2), (2, 3), (3, 4),      # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),      # Index
+    (0, 9), (9, 10), (10, 11), (11, 12), # Middle
+    (0, 13), (13, 14), (14, 15), (15, 16), # Ring
+    (0, 17), (17, 18), (18, 19), (19, 20), # Pinky
+    (5, 9), (9, 13), (13, 17), (0, 17), (0, 5) # Palm base connections
 ]
 
-# Landmark indices for clarity and readability
-# THUMB
-THUMB_MCP = 2  # Metacarpophalangeal joint
-THUMB_TIP = 4  # Tip of the thumb
+def draw_landmarks_on_image(rgb_image, hand_landmarks_list, hand_connections):
+    annotated_image = np.copy(rgb_image)
+    image_h, image_w, _ = annotated_image.shape
 
-# INDEX FINGER
-INDEX_MCP = 5
-INDEX_PIP = 6  # Proximal interphalangeal joint
-INDEX_TIP = 8
+    if hand_landmarks_list:
+        for hand_landmarks in hand_landmarks_list:
+            # Draw connections
+            for connection in hand_connections:
+                start_node = hand_landmarks[connection[0]]
+                end_node = hand_landmarks[connection[1]]
+                start_point = (int(start_node.x * image_w), int(start_node.y * image_h))
+                end_point = (int(end_node.x * image_w), int(end_node.y * image_h))
+                cv2.line(annotated_image, start_point, end_point, (0, 255, 0), 2)
 
-# MIDDLE FINGER
-MIDDLE_MCP = 9
-MIDDLE_PIP = 10
-MIDDLE_TIP = 12
+            # Draw landmarks
+            for landmark in hand_landmarks:
+                center = (int(landmark.x * image_w), int(landmark.y * image_h))
+                cv2.circle(annotated_image, center, 5, (0, 0, 255), -1) # Red filled circle
 
-# RING FINGER
-RING_MCP = 13
-RING_PIP = 14
-RING_TIP = 16
+    return annotated_image
 
-# PINKY FINGER
-PINKY_MCP = 17
-PINKY_PIP = 18
-PINKY_TIP = 20
+# --- Gesture Recognition Logic ---
+FINGER_TIPS = {
+    "Thumb": 4,
+    "Index": 8,
+    "Middle": 12,
+    "Ring": 16,
+    "Pinky": 20
+}
 
-def download_model_if_not_exists(model_path, model_url):
-    """
-    Downloads the MediaPipe hand landmarker model if it doesn't already exist locally.
-    """
-    if not os.path.exists(model_path):
-        print(f"Downloading {os.path.basename(model_path)}...")
-        try:
-            urllib.request.urlretrieve(model_url, model_path)
-            print(f"Downloaded {os.path.basename(model_path)} to {model_path}")
-        except Exception as e:
-            print(f"Error downloading model: {e}")
-            print("Please check your internet connection or the model URL.")
-            exit()
+FINGER_MCPS = { # Metacarpophalangeal joints (base of fingers)
+    "Thumb": 2, # Thumb's MCP is landmark 2 (Proximal Phalanx base)
+    "Index": 5,
+    "Middle": 9,
+    "Ring": 13,
+    "Pinky": 17
+}
 
-def draw_landmarks_and_connections(image, hand_landmarks_list, connections):
-    """
-    Draws landmarks and their connections on the input image using OpenCV.
+# Heuristic to check if a finger is extended (up)
+# This assumes an upright hand and camera Y-axis pointing down.
+# A finger is up if its tip's Y coordinate is significantly less (higher on screen)
+# than its MCP joint's Y coordinate.
+def is_finger_extended(landmarks, finger_name):
+    tip_idx = FINGER_TIPS[finger_name]
+    mcp_idx = FINGER_MCPS[finger_name]
+    
+    # Using a small offset for clearer distinction, adjust as needed
+    # This offset accounts for slight bends or detection noise.
+    y_offset = 0.02 
 
-    Args:
-        image: The OpenCV image (numpy array) to draw on.
-        hand_landmarks_list: A list of lists of NormalizedLandmark objects,
-                             where each inner list corresponds to one detected hand.
-        connections: A list of tuples defining which landmarks to connect.
-    Returns:
-        The image with drawn landmarks and connections.
-    """
-    if not hand_landmarks_list:
-        return image
+    # Compare the Y-coordinate of the tip with its MCP joint.
+    # If the tip is 'above' (smaller Y value) the MCP, it's considered extended.
+    return landmarks[tip_idx].y < landmarks[mcp_idx].y - y_offset
 
-    for landmarks_for_one_hand in hand_landmarks_list:
-        # Draw connections
-        for connection in connections:
-            start_point = (int(landmarks_for_one_hand[connection[0]].x * image.shape[1]),
-                           int(landmarks_for_one_hand[connection[0]].y * image.shape[0]))
-            end_point = (int(landmarks_for_one_hand[connection[1]].x * image.shape[1]),
-                         int(landmarks_for_one_hand[connection[1]].y * image.shape[0]))
-            cv2.line(image, start_point, end_point, (0, 255, 0), 2) # Green color for connections
-
-        # Draw landmarks (circles)
-        for i, lm in enumerate(landmarks_for_one_hand):
-            x, y = int(lm.x * image.shape[1]), int(lm.y * image.shape[0])
-            cv2.circle(image, (x, y), 5, (0, 0, 255), -1) # Red color for landmarks
-    return image
 
 def recognize_gesture(hand_landmarks_list, handedness_list):
-    """
-    Recognizes simple hand gestures based on landmark positions.
-
-    Args:
-        hand_landmarks_list: A list of lists of NormalizedLandmark objects for all detected hands.
-        handedness_list: A list of lists of Category objects indicating 'Left' or 'Right' hand.
-    Returns:
-        A string describing the detected gesture(s) or "No Hand".
-    """
-    if not hand_landmarks_list:
-        return "No Hand"
-
     gestures = []
-    for i, landmarks in enumerate(hand_landmarks_list):
-        current_handedness = handedness_list[i][0].category_name # e.g., 'Left' or 'Right'
+    if not hand_landmarks_list:
+        return gestures
 
-        # Fetch landmarks using defined constants for clarity
-        thumb_tip = landmarks[THUMB_TIP]
-        thumb_mcp = landmarks[THUMB_MCP]
-        index_tip = landmarks[INDEX_TIP]
-        index_pip = landmarks[INDEX_PIP]
-        middle_tip = landmarks[MIDDLE_TIP]
-        middle_pip = landmarks[MIDDLE_PIP]
-        ring_tip = landmarks[RING_TIP]
-        ring_pip = landmarks[RING_PIP]
-        pinky_tip = landmarks[PINKY_TIP]
-        pinky_pip = landmarks[PINKY_PIP]
+    for i, hand_landmarks in enumerate(hand_landmarks_list):
+        handedness = handedness_list[i][0].category_name
 
-        # Y-coordinate threshold for finger extension.
-        # A smaller Y-value means higher on the image.
-        Y_THRESHOLD = 0.05
+        fingers_up_status = {}
+        for finger_name in FINGER_TIPS.keys():
+            fingers_up_status[finger_name] = is_finger_extended(hand_landmarks, finger_name)
+        
+        num_fingers_up = sum(fingers_up_status.values())
 
-        # Check if a finger is "extended" by comparing its tip's Y-coordinate
-        # to its PIP joint's Y-coordinate.
-        is_index_extended = index_tip.y < index_pip.y - Y_THRESHOLD
-        is_middle_extended = middle_tip.y < middle_pip.y - Y_THRESHOLD
-        is_ring_extended = ring_tip.y < ring_pip.y - Y_THRESHOLD
-        is_pinky_extended = pinky_tip.y < pinky_pip.y - Y_THRESHOLD
+        current_gesture = "Unknown"
+        
+        if num_fingers_up == 0:
+            current_gesture = "Fist"
+        elif num_fingers_up == 1:
+            if fingers_up_status["Index"]:
+                current_gesture = "Pointing"
+            elif fingers_up_status["Thumb"]:
+                current_gesture = "Thumbs Up"
+        elif num_fingers_up == 2:
+            if fingers_up_status["Index"] and fingers_up_status["Middle"]:
+                current_gesture = "Peace/Victory"
+            elif fingers_up_status["Thumb"] and fingers_up_status["Pinky"]:
+                current_gesture = "Shaka"
+        elif num_fingers_up == 3:
+             current_gesture = "Three Fingers Up"
+        elif num_fingers_up == 4:
+            current_gesture = "Four Fingers Up"
+        elif num_fingers_up == 5:
+            current_gesture = "Open Hand"
+        
+        gestures.append(f"{handedness}: {current_gesture}")
 
-        # Thumb extension is more complex due to its unique articulation and rotation.
-        # This checks if the thumb tip is significantly higher than its MCP joint
-        # AND extends horizontally away from the palm, based on handedness.
-        is_thumb_extended = False
-        if current_handedness == 'Left':
-             # For a left hand, the thumb usually extends to the left (smaller X) and upwards (smaller Y)
-             is_thumb_extended = (thumb_tip.x < thumb_mcp.x - 0.03) and (thumb_tip.y < thumb_mcp.y)
-        elif current_handedness == 'Right':
-             # For a right hand, the thumb usually extends to the right (larger X) and upwards (smaller Y)
-             is_thumb_extended = (thumb_tip.x > thumb_mcp.x + 0.03) and (thumb_tip.y < thumb_mcp.y)
+    return gestures
 
-        gesture = "Unknown"
-
-        # Gesture Logic:
-        if is_index_extended and is_middle_extended and not is_ring_extended and not is_pinky_extended and not is_thumb_extended:
-            gesture = "Peace Sign"
-        elif is_thumb_extended and not is_index_extended and not is_middle_extended and not is_ring_extended and not is_pinky_extended:
-            gesture = "Thumbs Up"
-        elif is_index_extended and is_middle_extended and is_ring_extended and is_pinky_extended and is_thumb_extended:
-            gesture = "Open Hand"
-        elif not is_index_extended and not is_middle_extended and not is_ring_extended and not is_pinky_extended and not is_thumb_extended:
-             # If all fingers (and thumb) are not extended, it's likely a closed fist.
-            gesture = "Closed Fist"
-        elif is_index_extended and not is_middle_extended and not is_ring_extended and not is_pinky_extended and not is_thumb_extended:
-            gesture = "Pointing Index"
-        # Additional gestures can be added here with more specific landmark checks.
-
-        gestures.append(f"{current_handedness} Hand: {gesture}")
-    
-    # Return a comma-separated string of all detected gestures
-    return ", ".join(gestures) if gestures else "No Hand Detected"
-
+# --- Main Webcam Loop ---
 def main():
-    """
-    Main function to initialize the camera, MediaPipe Hand Landmarker,
-    process frames, recognize gestures, and display results.
-    """
-    download_model_if_not_exists(MODEL_PATH, MODEL_URL)
+    global detection_results, frame_timestamp_ms
 
-    # Initialize MediaPipe Hand Landmarker
-    # Configure to detect up to 2 hands.
-    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
-    options = vision.HandLandmarkerOptions(base_options=base_options, num_hands=2)
-    detector = vision.HandLandmarker.create_from_options(options)
-
-    # Initialize OpenCV camera capture
-    cap = cv2.VideoCapture(0) # 0 for the default camera
-
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("Error: Could not open video stream. Make sure camera is connected and not in use.")
+        print("Error: Could not open webcam.")
         return
+
+    print("Webcam opened successfully. Press 'q' to quit.")
+
+    # Variables for FPS calculation
+    prev_frame_time = 0
+    new_frame_time = 0
 
     while True:
         ret, frame = cap.read()
@@ -187,43 +170,57 @@ def main():
             print("Failed to grab frame.")
             break
 
-        # Flip the frame horizontally for a more intuitive mirror-like view
+        # Flip frame horizontally for a "selfie-view"
         frame = cv2.flip(frame, 1)
 
-        # Convert the BGR image (from OpenCV) to RGB (as MediaPipe expects RGB)
+        # Convert the BGR image to RGB as required by MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Create a MediaPipe Image object from the RGB frame
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        # Perform hand landmark detection
-        detection_result = detector.detect(mp_image)
+        # Get current timestamp for MediaPipe (milliseconds)
+        current_frame_timestamp = int(time.time() * 1000)
 
-        gesture_text = "No Hand Detected"
+        # Send image to MediaPipe for async detection
+        detector.detect_async(mp_image, current_frame_timestamp)
 
-        if detection_result.hand_landmarks:
-            all_hand_landmarks = detection_result.hand_landmarks
-            all_handedness = detection_result.handedness
+        # Initialize annotated_frame with original frame
+        annotated_frame = frame.copy()
 
-            # Draw landmarks and connections for all detected hands
-            frame = draw_landmarks_and_connections(frame, all_hand_landmarks, HAND_CONNECTIONS)
+        # Process results from the callback if available and matching current timestamp
+        if detection_results and frame_timestamp_ms == current_frame_timestamp:
+            if detection_results.hand_landmarks:
+                annotated_frame = draw_landmarks_on_image(
+                    annotated_frame, detection_results.hand_landmarks, HAND_CONNECTIONS
+                )
 
-            # Recognize gesture for all detected hands
-            gesture_text = recognize_gesture(all_hand_landmarks, all_handedness)
-        
-        # Display the recognized gesture text on the frame
-        cv2.putText(frame, f"Gesture: {gesture_text}", (10, 30),
+                # Recognize gesture
+                gestures = recognize_gesture(detection_results.hand_landmarks, detection_results.handedness)
+                for i, gesture_text in enumerate(gestures):
+                    cv2.putText(annotated_frame, gesture_text, (10, 30 + i * 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+            else:
+                cv2.putText(annotated_frame, "No hand detected", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+        else:
+            # If no fresh results, show a message or just the raw frame
+            cv2.putText(annotated_frame, "Detecting...", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA)
+
+        # Calculate and display FPS
+        new_frame_time = time.time()
+        fps = 1 / (new_frame_time - prev_frame_time)
+        prev_frame_time = new_frame_time
+        cv2.putText(annotated_frame, f"FPS: {int(fps)}", (frame.shape[1] - 150, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
-        # Show the frame
-        cv2.imshow('Gesture Recognition AI', frame)
+        cv2.imshow('Gesture AI', annotated_frame)
 
-        # Break the loop if 'q' is pressed
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Release the camera and destroy all OpenCV windows
     cap.release()
     cv2.destroyAllWindows()
+    detector.close() # Close the detector when done
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
